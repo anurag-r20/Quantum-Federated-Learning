@@ -116,6 +116,7 @@ tests/                           SEFOP-style pytest suite (unit tests mirror src
 .github/workflows/               CI: unit tests on every push and pull request
 .claude/skills/                  Claude Code skills: ibm-quantum, sefop-tests
 docs/figures/                    figures used in this README
+docs/FL_FHE_ECE_59500.pptx       ECE 59500 presentation of these results
 ```
 
 ## Original QFL notebooks
