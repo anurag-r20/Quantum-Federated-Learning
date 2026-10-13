@@ -1,39 +1,93 @@
-from typing import List, Tuple
-import numpy as np
-import time
-import os
+"""
+CKKS homomorphic encryption (TenSEAL) for federated learning model updates.
 
-# For the homomorphic encryption
-import pickle
-import tenseal as ts
-from flwr.common import NDArrays
+Every model tensor is flattened, zero-padded and packed into the slots of batched
+CKKS ciphertexts, so a whole state_dict can be encrypted (one ciphertext per
+SLOTS weights). The server only ever holds the public context: it can encrypt and
+add/scale ciphertexts (FedAvg), but it cannot decrypt anything.
+
+Adapted from data-science-lover/flower-homomorphic_encryption (Apache-2.0), via QFL-MLNCP.
+Changed: every tensor is encrypted (the original encrypted only a layer named 'fc3.weight', which
+none of the QFL models have), batched CKKS packing, shape-restoring decryption, single-multiply FedAvg.
+"""
+from typing import List, Optional, Sequence, Tuple
 from functools import reduce
+from io import BytesIO
+import math
+import operator
+import os
+import pickle
+import time
+
+import numpy as np
+import tenseal as ts
+from flwr.common import NDArrays, Parameters
+
+# CKKS parameters: N=8192 gives 4096 slots per ciphertext and ~128-bit security
+# with these moduli; two 40-bit levels are enough for one plaintext-scalar multiply.
+POLY_MODULUS_DEGREE = 8192
+COEFF_MOD_BIT_SIZES = [60, 40, 40, 60]
+GLOBAL_SCALE = 2 ** 40
+SLOTS = POLY_MODULUS_DEGREE // 2
+
+TENSOR_TYPE_CKKS = "tenseal.ckks"
+TENSOR_TYPE_NUMPY = "numpy.ndarray"
+
+
+def log_metric(message: str, save_results_path: Optional[str] = 'results/FL/'):
+    """Appends a timestamped message to <save_results_path>/timing_log.txt (no-op if path is None)."""
+    if save_results_path is None:
+        return
+    os.makedirs(save_results_path, exist_ok=True)
+    log_file_path = os.path.join(save_results_path, 'timing_log.txt')
+    try:
+        with open(log_file_path, 'a') as f:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception as e:
+        print(f"CRITICAL: Log file write failed. Error: {e} - Message: {message}")
 
 
 # /////////////////////// Homomorphic Encryption \\\\\\\\\\\\\\\\\\\\\\\\\\
 
 def context():
     """
-    This function is used to create the context of the homomorphic encryption:
-    it is used to create the keys and the parameters of the encryption scheme (CKKS).
+    Create a CKKS context holding a fresh key pair (secret, public and relinearization keys).
 
-    :return: the context of the homomorphic encryption
+    :return: the private TenSEAL context; share `ctx.serialize(save_secret_key=False)` with the server
     """
-    cont = ts.context(
-        ts.SCHEME_TYPE.CKKS,
-        poly_modulus_degree=8192,
-        # This means that the coefficient modulus will contain 4 primes of 60 bits, 40 bits, 40 bits, and 60 bits.
-        coeff_mod_bit_sizes=[60, 40, 40, 60]
-    )
-
-    cont.generate_galois_keys()  # You can create the Galois keys by calling generate_galois_keys
-    cont.global_scale = 2 ** 40  # global_scale: the scaling factor, here set to 2**40 (same that pow(2, 40))
+    cont = ts.context(ts.SCHEME_TYPE.CKKS, poly_modulus_degree=POLY_MODULUS_DEGREE,
+                      coeff_mod_bit_sizes=COEFF_MOD_BIT_SIZES)
+    cont.global_scale = GLOBAL_SCALE
     return cont
+
+
+def encrypt_array(ctx, array) -> ts.tensors.CKKSTensor:
+    """
+    Encrypt an array of any shape into a batched CKKS tensor.
+
+    The flattened array is zero-padded and reshaped to (SLOTS, n_ct): each of the n_ct
+    ciphertexts packs SLOTS values. At least 2 ciphertexts are used because TenSEAL
+    decrypts a batched (SLOTS, 1) tensor incorrectly (every slot returns the first value).
+    """
+    flat = np.asarray(array, dtype=np.float64).ravel()
+    n_ct = max(2, math.ceil(flat.size / SLOTS))
+    packed = np.zeros(SLOTS * n_ct)
+    packed[:flat.size] = flat
+    return ts.ckks_tensor(ctx, packed.reshape(SLOTS, n_ct), batch=True)
+
+
+def decrypt_array(enc, shape: Sequence[int], secret_key=None) -> np.ndarray:
+    """Decrypt a tensor produced by `encrypt_array` and restore its original shape."""
+    plain = enc.decrypt(secret_key) if secret_key is not None else enc.decrypt()
+    flat = np.asarray(plain.tolist(), dtype=np.float64).ravel()
+    n = int(np.prod(shape)) if len(shape) else 1
+    return flat[:n].reshape(shape).astype(np.float32)
 
 
 class Layer:
     """
-    This class is used to represent the weights of a layer of a neural network.
+    This class is used to represent the (plaintext) weights of a layer of a neural network.
 
     :param name_layer: the name of the layer
     :param weight: the weights of the layer
@@ -43,347 +97,235 @@ class Layer:
         self.weight_array = weight
 
     def get_name(self):
-        """
-        This function is used to get the name of the layer.
-        """
         return self.name
 
     def get_weight(self):
-        """
-        This function is used to get the weights of the layer.
-        """
         return self.weight_array
 
     def __add__(self, other):
-        """
-        This function is used to add the weights of two layers.
-
-        :param other: the other layer object
-        """
-        weights = other.get_weight() if type(other) == Layer else other
+        weights = other.get_weight() if isinstance(other, Layer) else other
         return Layer(self.name, self.weight_array + weights)
 
     def __sub__(self, other):
-        """
-        This function is used to substract the weights of two layers.
-
-        :param other: the other layer object
-
-        :return: the substraction result in the form of a layer object
-        """
-        weights = other.get_weight() if type(other) == Layer else other
+        weights = other.get_weight() if isinstance(other, Layer) else other
         return Layer(self.name, self.weight_array - weights)
 
     def __mul__(self, other):
-        """
-        This function is used to multiply the weights of two layers.
-
-        :param other: the other layer object
-
-        :return: the multiplication result in the form of a layer object
-        """
-        weights = other.get_weight() if type(other) == Layer else other
+        weights = other.get_weight() if isinstance(other, Layer) else other
         return Layer(self.name, self.weight_array * weights)
 
     def __truediv__(self, other):
-        """
-        This function is used to divide the weights of two layers.
-        It works only if the weights of the other layer are a number or a layer object (weights with the same shape).
-
-        :param other: the other layer object
-
-        :return: the division result in the form of a layer object
-        """
-        weights = other.get_weight() if type(other) == Layer else other
-        weights = self.weight_array * (1 / weights)
-        return Layer(self.name, weights)
+        weights = other.get_weight() if isinstance(other, Layer) else other
+        return Layer(self.name, self.weight_array * (1 / weights))
 
     def __len__(self):
-        """
-        This function is used to get the number of weights of the layer (the size of the layer).
-        """
-        somme = 1
-        for elem in self.weight_array.shape():
-            somme *= elem
-        return somme
+        return int(np.prod(np.shape(self.weight_array)))
 
     def shape(self):
-        """
-        This function is used to get the shape of the layer.
-        """
-        return self.weight_array.shape()
+        return np.shape(self.weight_array)
 
     def sum(self, axis=0):
-        """
-        This function is used to get the sum of the weights of the layer.
-
-        :param axis: the axis of the sum (default: 0 for the sum of the columns)
-
-        :return: the sum of the weights of the layer in the form of a layer object
-        """
         return Layer(f"sum_{self.name}", self.weight_array.sum(axis=axis))
 
     def mean(self, axis=0):
-        """
-        This function is used to get the mean of the weights of the layer.
-
-        :param axis: the axis of the mean (default: 0 for the mean of the columns)
-
-        :return: the mean of the weights of the layer in the form of a layer object
-        """
-        weights = self.weight_array.sum(axis=axis) * (1 / self.weight_array.shape[axis])
+        weights = self.weight_array.sum(axis=axis) * (1 / np.shape(self.weight_array)[axis])
         return Layer(f"sum_{self.name}", weights)
 
-    def decrypt(self, sk=None):
+    def decrypt(self, sk=None, shape=None):
         """
-        This function is used to decrypt the weights of the layer.
+        Return the weights as a float32 array (nothing to decrypt; same interface as CryptedLayer).
 
-        :param sk: the secret key used to decrypt the weights (default: None).
-        Not used in this class but this is to respect the same structure as the CryptedLayer class.
-
-        :return: the decrypted weights of the layer in the form of a list of weights
+        :param sk: unused
+        :param shape: optional shape to reshape the weights to
         """
-        return self.weight_array.tolist()
+        weights = np.asarray(self.weight_array, dtype=np.float32)
+        return weights.reshape(shape) if shape is not None else weights
 
     def serialize(self):
-        """
-        This function is used to serialize the weights of the layer.
-
-        :return: the serialized weights of the layer in the form of a dictionary
-        with the name of the layer as key and the weights as value
-        """
-
         return {self.name: self.weight_array}
 
 
 class CryptedLayer(Layer):
     """
-    This class is used to represent the crypted weights of a layer of a neural network.
+    This class is used to represent the encrypted weights of a layer of a neural network.
 
     :param name_layer: the name of the layer
-    :param weight: the crypted weights of the layer
-    :param contexte: the context of the encryption
+    :param weight: a CKKSTensor, its serialized bytes, or a plaintext tensor/array to encrypt
+    :param contexte: the context of the encryption (needed to encrypt plaintext weights)
     """
     def __init__(self, name_layer, weight, contexte=None):
         super(CryptedLayer, self).__init__(name_layer, weight)
-        if type(weight) == ts.tensors.CKKSTensor or type(weight) == bytes:
-            # If the weights are already encrypted or if they are bytes (serialized weights)
+        if isinstance(weight, (ts.tensors.CKKSTensor, bytes)):
             self.weight_array = weight
-
         else:
-            # If the weights are not encrypted, we encrypt them with the context
-            self.weight_array = ts.ckks_tensor(contexte, weight.cpu().detach().numpy())
+            if hasattr(weight, "detach"):
+                weight = weight.detach().cpu().numpy()
+            self.weight_array = encrypt_array(contexte, weight)
 
     def __add__(self, other):
-        """
-        This function is used to add the crypted weights of two layers.
-
-        :param other: the other layer object
-
-        :return: the addition result in the form of a crypted layer object
-        """
-        weights = other.get_weight() if type(other) == CryptedLayer else other
+        weights = other.get_weight() if isinstance(other, CryptedLayer) else other
         return CryptedLayer(self.name, self.weight_array + weights)
 
     def __sub__(self, other):
-        """
-        This function is used to substract the crypted weights of two layers.
-
-        :param other: the other layer object
-
-        :return: the substraction result in the form of a crypted layer object
-        """
-        weights = other.get_weight() if type(other) == CryptedLayer else other
+        weights = other.get_weight() if isinstance(other, CryptedLayer) else other
         return CryptedLayer(self.name, self.weight_array - weights)
 
     def __mul__(self, other):
-        """
-        This function is used to multiply the crypted weights of two layers.
-
-        :param other: the other layer object
-
-        :return: the multiplication result in the form of a crypted layer object
-        """
-        weights = other.get_weight() if type(other) == CryptedLayer else other
+        weights = other.get_weight() if isinstance(other, CryptedLayer) else other
         return CryptedLayer(self.name, self.weight_array * weights)
 
     def __truediv__(self, other):
-        """
-        This function is used to divide the crypted weights of two layers.
-
-        :param other: the other layer object
-
-        :return: the division result in the form of a crypted layer object
-        """
-        try:
-            # We try to divide the weights of the layer by the weights of the other layer or by a number
-            # It is possible only if the denominator is a number or a tensor of non-crypted weights
-            weights = other.get_weight() if type(other) == CryptedLayer else other
-            weights = self.weight_array * (1 / weights)
-
-        except:
-            print("Error: the division operator isn't supported by SEAL")
-            weights = []
-
-        return CryptedLayer(self.name, weights)
+        # Only division by a plaintext number is possible (multiplication by its inverse)
+        return CryptedLayer(self.name, self.weight_array * (1 / other))
 
     def shape(self):
-        """
-        This function is used to get the shape of the layer.
-
-        :return: the shape of the layer in the form of a tuple
-        """
         return self.weight_array.shape
 
-    def sum(self, axis=0):
+    def decrypt(self, sk=None, shape=None):
         """
-        This function is used to get the sum of the weights of the layer.
+        Decrypt the weights with the secret key.
 
-        :param axis: the axis of the sum (default: 0 for the sum of the columns)
-
-        :return: the sum of the weights of the layer in the form of a crypted layer object
+        :param sk: the secret key (default: the one held by the tensor's context, if any)
+        :param shape: original shape of the layer; without it the padded (SLOTS, n_ct) layout is returned
         """
-        return CryptedLayer(f"sum_{self.name}", self.weight_array.sum(axis=axis))
-
-    def mean(self, axis=0):
-        """
-        This function is used to get the mean of the weights of the layer.
-
-        :param axis: the axis of the mean (default: 0 for the mean of the columns)
-
-        :return: the average of the weights of the layer in the form of a crypted layer object
-        """
-        weights = self.weight_array.sum(axis=axis) * (1 / self.weight_array.shape[axis])
-        return CryptedLayer(f"sum_{self.name}", weights)
-
-    def decrypt(self, sk=None):
-        """
-        This function is used to decrypt the weights of the layer.
-
-        :param sk: the secret key used to decrypt the weights (default: None)
-
-        :return: the decrypted weights of the layer in the form of a list of weights
-        """
-        return self.weight_array.decrypt(sk).tolist() if sk else self.weight_array.decrypt().tolist()
+        if shape is not None:
+            return decrypt_array(self.weight_array, shape, sk)
+        plain = self.weight_array.decrypt(sk) if sk is not None else self.weight_array.decrypt()
+        return np.asarray(plain.tolist(), dtype=np.float32)
 
     def serialize(self):
-        """
-        This function is used to serialize the weights of the layer.
-
-        :return: the serialized weights of the layer in the form of a dictionary
-        """
         return {self.name: self.weight_array.serialize()}
 
 
 def crypte(client_w, context_c):
     """
-    This function is used to crypte the weights of a neural network.
+    Encrypt every tensor of a state_dict.
 
-    :param client_w: dictionary of the weights of a neural network
-    :param context_c: the context of the encryption
-    :return: a list of Layer objects (crypted weights or not)
+    :param client_w: dictionary name -> weights of a neural network
+    :param context_c: the context of the encryption (the public context is enough)
+    :return: a list of CryptedLayer objects
     """
-    encrypted = []
-    for name_layer, weight_array in client_w.items():
-        start_time = time.time()
-        if name_layer == 'fc3.weight':
-            encrypted.append(CryptedLayer(name_layer, weight_array, context_c))
-
-        else:
-            encrypted.append(Layer(name_layer, weight_array))
-
-        print(name_layer, (time.time() - start_time))
-
-    # return [CryptedLayer(name_layer, weight_array, context_c) for name_layer, weight_array in client_w.items()]
-    return encrypted
+    return [CryptedLayer(name_layer, weight_array, context_c) for name_layer, weight_array in client_w.items()]
 
 
 def read_query(file_path):
     """
-    This function is used to read a pickle file.
+    Read a pickled query {"contexte": <serialized context>, ...}.
 
     :param file_path: the path of the file to read
-    :return: the query and the context
+    :return: the remaining query items and the serialized context
     """
-    if os.path.exists(file_path):
-        with open(file_path, 'rb') as file:
-            """
-            # pickle.load(f)  # load to read file object
-
-            file_str = f.read()
-            client_query1 = pickle.loads(file_str)  # loads to read str class
-            """
-            query_str = pickle.load(file)
-
-        contexte = query_str["contexte"]  # ts.context_from(query["contexte"])
-        del query_str["contexte"]
-        return query_str, contexte
-
-    else:
-        print("The file doesn't exist")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(file_path)
+    with open(file_path, 'rb') as file:
+        query = pickle.load(file)
+    contexte = query.pop("contexte")
+    return query, contexte
 
 
 def write_query(file_path, client_query):
     """
-    This function is used to write a pickle file.
+    Pickle a query to a file.
 
     :param file_path: the path of the file to write
-
     :param client_query: the query to write
     """
-    with open(file_path, 'wb') as file:  # 'ab' to add existing file
-        encode_str = pickle.dumps(client_query)
-        file.write(encode_str)
+    with open(file_path, 'wb') as file:
+        pickle.dump(client_query, file)
 
 
 def deserialized_layer(name_layer, weight_array, ctx):
     """
-    This function is used to deserialized a layer (crypted or not).
-    i.e. to transform the weights of a layer in the correct format (not bytes).
+    Turn serialized/encrypted/plain weights into a Layer or CryptedLayer.
 
     :param name_layer: the name of the layer
-    :param weight_array: the weights of the layer
-    :param ctx: the context (if the layer is crypted)
-    :return: the object Layer or CryptedLayer with the weights of the layer in the correct format
+    :param weight_array: CKKSTensor, serialized bytes (ciphertext or np.save output) or array
+    :param ctx: the context (if the layer is encrypted)
     """
-    if type(weight_array) == bytes:
-        return CryptedLayer(name_layer, ts.ckks_tensor_from(ctx, weight_array), ctx)
-
-    elif type(weight_array) == ts.tensors.CKKSTensor:
+    if isinstance(weight_array, bytes):
+        try:
+            return CryptedLayer(name_layer, ts.ckks_tensor_from(ctx, weight_array), ctx)
+        except Exception:
+            return Layer(name_layer, np.load(BytesIO(weight_array), allow_pickle=False))
+    if isinstance(weight_array, ts.tensors.CKKSTensor):
         return CryptedLayer(name_layer, weight_array, ctx)
-
-    else:
-        return Layer(name_layer, weight_array)
+    return Layer(name_layer, weight_array)
 
 
 def deserialized_model(client_query, ctx):
-    """
-    This function is used to deserialized a model (crypted or not).
-    i.e. to transform the weights of a model in the correct format (not bytes).
-
-    :param client_query: the model
-    :param ctx: the context (if the model is crypted)
-    :return: the model with the weights in the correct format
-    """
+    """Deserialize every layer of a {name: weights} query."""
     return [deserialized_layer(name_layer, weight_array, ctx) for name_layer, weight_array in client_query.items()]
 
 
-# Redefine the aggregate function (defined in Flower)
-def aggregate_custom(results: List[Tuple[NDArrays, int]]) -> NDArrays:
-    """Compute weighted average.
-    Args:
-        results: List of tuples containing the model weights and the number of samples used to compute the weights.
-    Returns: A list of model weights averaged according to the number of samples used to compute the weights.
+# //////////////////////// Flower Parameters <-> weights \\\\\\\\\\\\\\\\\\\\\\\\
+
+def weights_to_parameters(weights) -> Parameters:
+    """Serialize a list of CKKSTensors or arrays into Flower Parameters (tensor_type tells which)."""
+    if weights and isinstance(weights[0], ts.tensors.CKKSTensor):
+        return Parameters(tensors=[w.serialize() for w in weights], tensor_type=TENSOR_TYPE_CKKS)
+    tensors = []
+    for w in weights:
+        buffer = BytesIO()
+        np.save(buffer, np.asarray(w), allow_pickle=False)
+        tensors.append(buffer.getvalue())
+    return Parameters(tensors=tensors, tensor_type=TENSOR_TYPE_NUMPY)
+
+
+def parameters_to_weights(parameters: Parameters, ctx=None) -> list:
+    """Deserialize Flower Parameters into CKKSTensors (needs a context) or numpy arrays."""
+    if parameters.tensor_type == TENSOR_TYPE_CKKS:
+        if ctx is None:
+            raise ValueError("A TenSEAL context is required to load encrypted parameters")
+        return [ts.ckks_tensor_from(ctx, tensor) for tensor in parameters.tensors]
+    return [np.load(BytesIO(tensor), allow_pickle=False) for tensor in parameters.tensors]
+
+
+def ndarray_to_bytes_ckks(ndarray) -> bytes:
+    """Flower's ndarray_to_bytes, extended: CKKS tensors are serialized, bytes pass through unchanged."""
+    if isinstance(ndarray, ts.tensors.CKKSTensor):
+        return ndarray.serialize()
+    if isinstance(ndarray, bytes):
+        return ndarray
+    if hasattr(ndarray, "detach"):
+        ndarray = ndarray.detach().cpu().numpy()
+    buffer = BytesIO()
+    np.save(buffer, ndarray, allow_pickle=False)
+    return buffer.getvalue()
+
+
+def bytes_to_ndarray_ckks(tensor: bytes):
+    """Flower's bytes_to_ndarray, extended: a CKKS ciphertext is returned as bytes, for a key holder to decrypt."""
+    try:
+        return np.load(BytesIO(tensor), allow_pickle=False)
+    except ValueError:
+        return tensor
+
+
+def enable_ckks_in_flower():
     """
-    # Calculate the total number of examples used during training
-    num_examples_total = sum([num_examples for _, num_examples in results])
-    # Create a list of weights, each multiplied by the related number of examples
+    Let Flower's NumPyClient send and receive CKKS ciphertexts, in every process that imports `utils`.
+
+    The original QFL notebooks patched these converters in the notebook process only. Flower's Ray workers
+    import flwr afresh, so their clients crashed on np.save(CKKSTensor) as soon as updates were really encrypted.
+    """
+    import flwr.common.parameter as flwr_parameter
+
+    flwr_parameter.ndarray_to_bytes = ndarray_to_bytes_ckks
+    flwr_parameter.bytes_to_ndarray = bytes_to_ndarray_ckks
+
+
+def aggregate_custom(results: List[Tuple[NDArrays, int]], log_path: Optional[str] = None) -> NDArrays:
+    """
+    FedAvg: weighted average of client weights, valid for numpy arrays and CKKS ciphertexts.
+
+    Each client's weights are scaled once by n_k / n (one CKKS level) and then summed,
+    so the server never needs to decrypt.
+    """
+    start_time = time.time()
+    num_examples_total = sum(num_examples for _, num_examples in results)
     weighted_weights = [
-        [layer * num_examples for layer in weights] for weights, num_examples in results
+        [layer * (num_examples / num_examples_total) for layer in weights] for weights, num_examples in results
     ]
-    # Compute average weights of each layer
-    weights_prime: NDArrays = [
-        reduce(np.add, layer_updates) * (1/num_examples_total)
-        for layer_updates in zip(*weighted_weights)
-    ]
+    weights_prime = [reduce(operator.add, layer_updates) for layer_updates in zip(*weighted_weights)]
+    log_metric(f"[S Agg] Time: {time.time() - start_time:.4f}s", log_path)
     return weights_prime

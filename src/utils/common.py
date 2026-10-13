@@ -1,10 +1,16 @@
+from collections import OrderedDict
+from typing import List
+import os
+import time
+
+import numpy as np
 import torch
+import torch.nn.functional
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 import seaborn as sn
 import pandas as pd
-import torch.nn.functional
-from collections import OrderedDict
+
 from .security import *
 
 def choice_device(device):
@@ -222,41 +228,39 @@ def plot_graph(list_xplot, list_yplot, x_label, y_label, curve_labels, title, pa
     if path:
         plt.savefig(path)
 
-def get_parameters2(net, context_client=None) -> List[np.ndarray]:
+def get_parameters2(net, context_client=None, save_path='results/FL/') -> List:
     """
-    Get the parameters of the network
-    :param net: network to get the parameters (weights and biases)
-    :param context_client: context of the crypted weights (if None, return the clear weights)
-    :return: list of parameters (weights and biases) of the network
+    Get the parameters of the network: CKKS-encrypted tensors if context_client is provided
+    (the public context is enough), plaintext numpy arrays otherwise.
     """
     if context_client:
-        # Crypte of the model trained at the client for a given round (after each round the model is aggregated between
-        # clients)
-        encrypted_tensor = crypte(net.state_dict(), context_client)  # list of encrypted layers (weights and biases)
-
+        start_time = time.time()
+        encrypted_tensor = crypte(net.state_dict(), context_client)
+        log_metric(f"[C Enc] Time: {time.time() - start_time:.4f}s", save_path)
         return [layer.get_weight() for layer in encrypted_tensor]
 
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
-def set_parameters(net, parameters: List[np.ndarray], context_client=None):
-    """
-    Update the parameters of the network with the given parameters (weights and biases)
-    :param net: network to set the parameters (weights and biases)
-    :param parameters: list of parameters (weights and biases) to set
-    :param context_client: context of the crypted weights (if None, set the clear weights)
-    """
-    params_dict = zip(net.state_dict().keys(), parameters)
-    if context_client:
-        secret_key = context_client.secret_key()
-        dico = {k: deserialized_layer(k, v, context_client) for k, v in params_dict}
 
+def set_parameters(net, parameters: List, context_client=None, save_path='results/FL/'):
+    """
+    Load parameters (weights and biases) into the network. With context_client (which must hold
+    the secret key), encrypted parameters are decrypted first; plaintext ones are loaded as is.
+    """
+    reference = net.state_dict()
+    if context_client:
+        start_time = time.time()
+        secret_key = context_client.secret_key()
         state_dict = OrderedDict(
-            {k: torch.Tensor(v.decrypt(secret_key)) for k, v in dico.items()}
+            (name, torch.as_tensor(deserialized_layer(name, value, context_client)
+                                   .decrypt(secret_key, shape=tuple(ref.shape)), dtype=ref.dtype))
+            for (name, ref), value in zip(reference.items(), parameters)
+        )
+        log_metric(f"[C Dec] Time: {time.time() - start_time:.4f}s", save_path)
+    else:
+        state_dict = OrderedDict(
+            (name, torch.as_tensor(np.asarray(value), dtype=ref.dtype).reshape(ref.shape))
+            for (name, ref), value in zip(reference.items(), parameters)
         )
 
-    else:
-        dico = {k: torch.Tensor(v) for k, v in params_dict}
-        state_dict = OrderedDict(dico)
-
     net.load_state_dict(state_dict, strict=True)
-    print("Updated model")
