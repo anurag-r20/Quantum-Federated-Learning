@@ -1,0 +1,18 @@
+# Tested on Python 3.10 (CPU). Install torch/torchvision first from the right index: see run-cpu.sh / run-gpu.sh.
+flwr[simulation]==1.5.0      # pins ray==2.6.3
+setuptools<70                # ray 2.6 still imports pkg_resources
+tenseal==0.3.16              # 0.3.17+ needs Python >= 3.11
+numpy<2
+scipy==1.15.3
+pennylane==0.42.3
+matplotlib==3.10.9
+pandas==2.3.3
+scikit-learn==1.7.2
+seaborn==0.13.2
+pillow==12.3.0
+tqdm==4.70.1
+ipykernel==7.3.0
+nbconvert==7.17.2
+kaggle                       # only to download the MRI dataset
+pytest==9.1.1
+pytest-cov==7.1.0

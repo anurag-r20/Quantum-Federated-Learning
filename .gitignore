@@ -3,3 +3,9 @@ data
 results
 *.pt
 *pycache*
+archive
+keys
+.ipynb_checkpoints
+.coverage
+htmlcov
+.pytest_cache

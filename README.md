@@ -1,102 +1,184 @@
-# QFed+FHE: Quantum Federated Learning with Secure Fully Homomorphic Encryption (FHE)
+# Quantum Federated Learning: privacy attacks with and without FHE
 
-![image](https://github.com/user-attachments/assets/933ee156-7599-4ed8-9f2a-754677d60a94)
+This repository builds on [QFL-MLNCP](https://github.com/elucidator8918/QFL-MLNCP-NeurIPS), the code for
+*Federated Learning with Quantum Computing and Fully Homomorphic Encryption*
+([arXiv:2409.11430](https://arxiv.org/abs/2409.11430)), and asks what fully homomorphic encryption (FHE)
+actually protects in federated learning (FL).
 
-## Overview
+Three simulated hospitals train a brain-tumour MRI classifier with [Flower](https://flower.ai). The training is attacked
+twice, once with plaintext updates and once with every update encrypted under CKKS ([TenSEAL](https://github.com/OpenMined/TenSEAL)):
 
-Welcome to the Quantum Federated Learning (QFL) repository, which utilizes Secure Fully Homomorphic Encryption (FHE). This initiative seeks to advance privacy-preserving multimodal machine learning in quantum environments.
+- a **gradient inversion attack (GIA)**: the server rebuilds a client's private scan from that client's update;
+- a **model inversion attack (MIA)**: anyone holding the final model recovers what each tumour class looks like.
 
-Quantum Federated Learning - QFL combines the principles of federated learning with the computational power of quantum computing. In a federated learning setup, multiple decentralized devices collaboratively train a model without sharing their local data. Each device trains the model on its own data and only shares the model updates. MQFL takes this a step further by leveraging quantum computing to handle the complex computations involved in the training process, thereby improving efficiency and potentially unlocking new capabilities in machine learning.
+## Results
 
-Secure Fully Homomorphic Encryption - Secure Fully Homomorphic Encryption (FHE) is a form of encryption that allows computations to be performed on encrypted data without needing to decrypt it first. This ensures that sensitive data remains private and secure even while being processed. By integrating FHE into the federated learning framework, we can ensure that model updates are encrypted throughout the entire process, maintaining privacy and security across all participants.
+From [`src/FL_Privacy_Attacks_MRI.ipynb`](src/FL_Privacy_Attacks_MRI.ipynb): 3 clients, IID split, 10 rounds, CPU only.
 
-Technical Paper Link - https://arxiv.org/abs/2409.11430
+| | Plaintext FL | FHE FL (CKKS) |
+|---|---|---|
+| Test accuracy of the final model | 93.49% | 93.23% |
+| Upload per client per round | 2.0 MB | 45.3 MB |
+| Training time (10 rounds) | 100 s | 120 s |
+| GIA on one client update | **reconstructed** (PSNR 26.9 dB, SSIM 0.83) | **blocked**: the server has no secret key |
+| MIA attack accuracy (independent classifier) | 3 / 4 classes | 4 / 4 classes |
 
-<!-- 
-The comprehensive results section can be seen:
+Multithreaded CPU training is not bit-for-bit reproducible. Across two full runs the test accuracy moved by
+under half a point, the GIA reconstruction scored PSNR 26.9 to 29.1 dB (SSIM 0.83 to 0.89), and MIA attack
+accuracy was 3 or 4 of 4 classes for each model.
 
-| **Model**                                                                                  | **Num Rounds** | **Num Clients** | **Dataset Used**        | **FHE Activated** | **Central Validation Accuracy** | **Loss** | **Training Accuracy** | **Simulation Time**        |
-|--------------------------------------------------------------------------------------------|---------------|-----------------|-------------------------|-------------------|-------------------------------|---------|-----------------------|---------------------------|
-| [FHE-FedQNN-CIFAR](https://github.com/elucidator8918/QFL-MLNCP-NeurIPS/blob/main/src/FHE_FedQNN_CIFAR.ipynb) | 20            | 10              | CIFAR-10                | Yes               | 70.12%                        | 1.24    | 99.1%                 | 9389.21 sec (156.5 min)   |
-| [FHE-FedQNN-MRI](https://github.com/elucidator8918/QFL-MLNCP-NeurIPS/blob/main/src/FHE_FedQNN_MRI.ipynb)   | 20            | 10              | Brain MRI Scan          | Yes               | 88.75%                        | 0.36    | 99.6%                 | 7309.01 sec (121.8 min)   |
-| [Standard-FedQNN-CIFAR](https://github.com/elucidator8918/QFL-MLNCP-NeurIPS/blob/main/src/Standard_FedQNN_CIFAR.ipynb) | 20            | 10              | CIFAR-10                | No                | 72.16%                        | 1.202   | 97.15%                | 9090.41 sec (151.5 min)   |
-| [Standard-FedQNN-MRI](https://github.com/elucidator8918/QFL-MLNCP-NeurIPS/blob/main/src/Standard_FedQNN_MRI.ipynb)   | 20            | 10              | Brain MRI Scan          | No                | 89.71%                        | 0.338   | 100%                  | 7537.57 sec (125.6 min)   | -->
+![Gradient inversion: private scan, plaintext reconstruction, and the ciphertext the FHE server holds](docs/figures/gia.png)
 
-## Repository Structure
+![Validation accuracy per round and upload size, plaintext vs FHE](docs/figures/training.png)
 
-```
-.
-├── src/
-│   ├── utils/
-│   ├── FHE_FedQNN_CIFAR.ipynb
-│   ├── FHE_FedQNN_MRI.ipynb
-│   ├── Standard_FedQNN_CIFAR.ipynb
-│   └── Standard_FedQNN_MRI.ipynb
-├── run-cpu.sh
-├── run-gpu.sh
-├── .gitignore
-└── README.md
-```
+![Model inversion of both final models](docs/figures/mia.png)
 
-## Installation
+What this shows:
 
-### Clone the Repository
+1. With plaintext updates, the server rebuilds a client's private scan almost exactly from a single-image update,
+   including the label (recovered analytically).
+2. With CKKS, the server only ever holds ciphertext and the public key. It still averages the updates, but it cannot
+   decrypt any of them. Accuracy is unchanged; each upload is about 22 times larger.
+3. FHE does not protect the finished model. Clients decrypt it to use it, and model inversion recovers
+   class-representative images from both the plaintext and the FHE model.
+
+## Threat model and limitations
+
+- **Attacker for GIA:** an honest-but-curious server. In one round (`capture_round`) clients send a single SGD step on
+  one image (FedSGD), the setting studied by DLG, iDLG and Geiping et al. All other rounds use FedAvg with 2 local
+  epochs over about 1,700 images; updates like that are much harder to invert.
+- **One shared key:** all clients use the same CKKS key pair, so FHE protects updates from the server, not from a
+  client that colludes with it. Threshold or multi-key HE would be needed for that.
+- **MIA output:** the reconstructions are class prototypes, not specific patients. They are scored by an independent
+  classifier trained on the private data (attack accuracy, as in Zhang et al. 2020). The image prior is a PCA fitted on
+  the held-out Testing split, treated as public data.
+- **Scale:** 64x64 grayscale scans and a 0.5M-parameter CNN, small enough to encrypt every weight every round on a laptop.
+
+## Fixes to the original QFL code
+
+- **FHE encrypted nothing.** `crypte()` in `src/utils/security.py` came from a Flower + TenSEAL tutorial
+  ([data-science-lover/flower-homomorphic_encryption](https://github.com/data-science-lover/flower-homomorphic_encryption))
+  and encrypted only a layer named `fc3.weight`. The tutorial's LeNet has that layer; none of the QFL models do, so every
+  "FHE" run sent plaintext. Every tensor is now packed into batched CKKS ciphertexts. The upstream QFL repository still has
+  this issue.
+- **TenSEAL batching bug** (0.3.16 to 0.3.18, the latest release): a batched tensor whose last axis has size 1
+  encrypts its first value into every slot. `encrypt_array` always uses at least two ciphertexts per tensor to avoid
+  it. Fix submitted upstream: [OpenMined/TenSEAL#534](https://github.com/OpenMined/TenSEAL/pull/534).
+- FedAvg over ciphertexts uses one plaintext-scalar multiply per update (fits the CKKS level budget), and decryption
+  restores each layer's shape.
+- The QNN MRI notebooks requested 2 GPUs even on CPU-only machines, which leaves Ray waiting forever; GPUs are now
+  requested only when CUDA is available.
+- The non-IID MRI split reads labels from the dataset index instead of decoding every image.
+- With real encryption, the FHE notebooks' clients crashed in Flower's Ray workers (`np.save` on a CKKS
+  tensor): the notebooks patched Flower's converters only in the notebook process. `utils` now installs
+  CKKS-aware converters in every process that imports it.
+- `qml.device("default.qubit.torch")` no longer exists in PennyLane; the notebooks use `default.qubit`.
+- The MRI FedNN notebooks' `evaluate()` called undefined helpers, reported 0 examples on the resulting
+  error, and crashed the server with a division by zero; it now uses `set_parameters` and `engine.test`.
+
+## Setup
 
 ```bash
-git clone https://github.com/elucidator8918/QFL-MLNCP-NeurIPS.git
-cd QFL-MLNCP-NeurIPS
-```
-
-### Install Dependencies
-
-#### For CPU
-
-```bash
-conda create -n fed python=3.10.12 anaconda
-conda init
+conda create -n fed python=3.10
 conda activate fed
-bash run-cpu.sh
+bash run-cpu.sh        # or run-gpu.sh
+
+# Brain-tumour MRI dataset (needs a Kaggle API token)
+cd src
+kaggle datasets download -d masoudnickparvar/brain-tumor-mri-dataset
+mkdir -p data/MRI && unzip brain-tumor-mri-dataset.zip -d data/MRI && rm brain-tumor-mri-dataset.zip
 ```
 
-#### For GPU
+## Run
 
 ```bash
-conda create -n fed python=3.10.12 anaconda
-conda init
-conda activate fed
-bash run-gpu.sh
+cd src
+jupyter nbconvert --to notebook --execute --inplace FL_Privacy_Attacks_MRI.ipynb   # or open it in Jupyter
 ```
 
-### Running Experiments
+The full run takes about 10 minutes on a 12-core CPU. Outputs go to `src/results/` (figures, `summary.json`, per-mode
+reports); CKKS keys go to `src/keys/`. Both folders are git-ignored.
 
-Choose the appropriate notebook based on your dataset and encryption preference:
+## Repository layout
 
-#### FHE-enabled Quantum Federated Learning
+```
+src/
+  FL_Privacy_Attacks_MRI.ipynb   main experiment: training, GIA, MIA, summary
+  federated.py                   Flower client and strategy, plaintext or CKKS updates, server-side recording
+  gia_attack.py                  gradient inversion (iDLG label, analytic FC input, cosine + TV matching)
+  mia_attack.py                  model inversion with a PCA image prior and an evaluation classifier
+  models.py                      MRINet (attacked model) and EvaluationNet (scores MIA)
+  utils/security.py              CKKS encryption of model weights, FedAvg over ciphertexts
+  utils/data_setup.py            datasets, cached 64x64 MRI arrays, IID / non-IID splits
+  utils/common.py, engine.py     parameter get/set, plotting, train/test loops
+  {Standard,FHE}_Fed{NN,QNN}_{CIFAR,MRI}.ipynb   original QFL notebooks (see below)
+tests/                           SEFOP-style pytest suite (unit tests mirror src/; integration/ runs Flower)
+.github/workflows/               CI: unit tests on every push and pull request
+.claude/skills/                  Claude Code skills: ibm-quantum, sefop-tests
+docs/figures/                    figures used in this README
+```
 
-- **CIFAR-10 Dataset:**
-  - Notebook: `src/FHE_FedQNN_CIFAR.ipynb`
-  - Description: CIFAR-10 consists of 60,000 32x32 color images in 10 classes, with 6,000 images per class. It is widely used for image classification tasks.
+## Original QFL notebooks
 
-- **MRI Scan Dataset:**
-  - Notebook: `src/FHE_FedQNN_MRI.ipynb`
-  - Description: This dataset contains MRI scans used for medical image analysis, particularly for detecting and diagnosing conditions based on scan data.  
+The eight notebooks from QFL-MLNCP train classical (NN) and quantum-hybrid (QNN, PennyLane) models on CIFAR-10
+and MRI at 224x224. A first smoke test (1 round, 1 local epoch, 2 clients) found the notebook issues listed under
+"Fixes to the original QFL code"; the notebooks have not been re-run after those fixes. With every layer now
+encrypted, an FHE update of the 224x224 MRI model is about 3,100 ciphertexts (roughly 1 GB) per client per round,
+so the FHE notebooks need far more memory and time than the 64x64 experiment above.
 
-#### Standard Quantum Federated Learning
+## Tests
 
-- **CIFAR-10 Dataset:**
-  - Notebook: `src/Standard_FedQNN_CIFAR.ipynb`
-  - Description: The same CIFAR-10 dataset, utilized without the FHE layer, for benchmarking and comparison.
+The suite follows SEFOP conventions (the `sefop-tests` skill): one test file per module, names of the form
+`test__unit__scenario__outcome`, Arrange / Act / Assert, and expected values from an oracle, never from the code
+under test (hand calculations, autograd gradients, encrypt/decrypt identities, the server's inability to decrypt).
 
-- **MRI Scan Dataset:**
-  - Notebook: `src/Standard_FedQNN_MRI.ipynb`
-  - Description: The same MRI scan dataset, used without FHE to evaluate the performance of standard federated learning models.
+```bash
+pytest -m "not integration"          # 99 unit tests, about 10 s, no dataset needed
+pytest -m integration                # 2 end-to-end Flower simulations (plaintext and FHE), about 25 s
+pytest --cov=src --cov-report=term-missing
+```
 
-## License
+A mutation check (`tests/mutations.json`, 12 deliberate bugs such as a sign flip in the server's gradient, an
+unweighted FedAvg or a single-ciphertext tensor) is caught in full by the unit tests:
 
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
+```bash
+python .claude/skills/sefop-tests/scripts/mutation_check.py --repo . --mutations tests/mutations.json \
+    --pytest-args "-m 'not integration' -x -q -p no:cacheprovider"
+```
 
-## Contact
+### Known bugs
 
-For inquiries, please reach out here:
-- forsomethingnewsid@gmail.com
-- pavana.karanth17@gmail.com
+Each is pinned by a strict `xfail` test that states the correct behaviour; fixing the bug makes that test pass
+and the run fail until the marker is removed.
+
+| ID | Severity | Where | What happens | Test |
+|---|---|---|---|---|
+| BUG-01 | M | `src/utils/engine.py`, `test()` and `train_step()` | Accuracy and loss are averaged over batches, not samples, so a smaller last batch is over-weighted (3 samples, batch 2: reports 50% instead of 66.7%). Reported test accuracies are affected slightly. | `tests/utils/test_engine.py` |
+| BUG-02 | L | `src/mia_attack.py`, `nearest_private_images()` | Asks `torch.topk` for 10 neighbours even when fewer private images exist, and raises. | `tests/test_mia_attack.py` |
+
+## Claude Code skills
+
+- `.claude/skills/ibm-quantum` sets up and verifies access to IBM Quantum hardware (IBM Quantum Platform via
+  qiskit-ibm-runtime) and estimates what a hardware run costs. Credentials are stored by qiskit in your home
+  directory, never in the repository.
+- `.claude/skills/sefop-tests` writes and audits SEFOP-style test suites; it produced `tests/`.
+
+Claude Code picks both up automatically inside this repository.
+
+## References
+
+- Zhu, Liu, Han. *Deep Leakage from Gradients.* NeurIPS 2019.
+- Zhao, Mopuri, Bilen. *iDLG: Improved Deep Leakage from Gradients.* 2020.
+- Geiping, Bauermeister, Dröge, Moeller. *Inverting Gradients: How easy is it to break privacy in federated learning?* NeurIPS 2020.
+- Zhang et al. *The Secret Revealer: Generative Model-Inversion Attacks Against Deep Neural Networks.* CVPR 2020.
+- Dutta, Karanth, Xavier, de Freitas, Innan, Ben Yahia, Shafique, Bernal Neira. *Federated Learning with Quantum
+  Computing and Fully Homomorphic Encryption: A Novel Computing Paradigm Shift in Privacy-Preserving ML.*
+  arXiv:2409.11430, 2024.
+
+## License and credits
+
+MIT, see [LICENSE](LICENSE). The QFL notebooks and utilities come from
+[elucidator8918/QFL-MLNCP-NeurIPS](https://github.com/elucidator8918/QFL-MLNCP-NeurIPS). The CKKS helpers in
+`src/utils/security.py` are adapted from
+[data-science-lover/flower-homomorphic_encryption](https://github.com/data-science-lover/flower-homomorphic_encryption)
+(Apache-2.0).

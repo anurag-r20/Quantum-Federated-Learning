@@ -1,3 +1,5 @@
 #!/bin/bash
-
-pip install flwr==1.5.0 tqdm numpy pennylane "ray>=2.3.0" matplotlib pillow scikit-learn seaborn pandas opacus pyyaml tenseal kaggle torch torchvision torchaudio
+# conda create -n fed python=3.10 && conda activate fed && bash run-gpu.sh
+set -e
+pip install torch==2.2.2 torchvision==0.17.2
+pip install -r requirements.txt

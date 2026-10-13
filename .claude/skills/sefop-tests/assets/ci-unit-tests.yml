@@ -1,0 +1,28 @@
+# GitHub Actions: run the fast unit tests on every push to main and every pull request.
+# Copy to .github/workflows/ci-unit-tests.yml. Integration tests (marked "integration") need solvers,
+# licences or large data, so they run locally or in a separate, manually triggered workflow.
+name: CI — Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch cancels the older run instead of queueing both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # match the version requirements.txt was verified with
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run unit tests with coverage
+        run: pytest -m "not integration" --cov --cov-report=term-missing
