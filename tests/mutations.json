@@ -1,0 +1,14 @@
+[
+  {"file": "src/utils/security.py", "find": "n_ct = max(2, math.ceil(flat.size / SLOTS))", "replace": "n_ct = max(1, math.ceil(flat.size / SLOTS))", "description": "allow 1 ciphertext (TenSEAL (n,1) batching bug)"},
+  {"file": "src/utils/security.py", "find": "layer * (num_examples / num_examples_total)", "replace": "layer * (1 / len(results))", "description": "FedAvg ignores example counts"},
+  {"file": "src/utils/security.py", "find": "return flat[:n].reshape(shape).astype(np.float32)", "replace": "return flat[1:n + 1].reshape(shape).astype(np.float32)", "description": "decrypt off by one slot"},
+  {"file": "src/utils/data_setup.py", "find": "/ 255.0 - MRI_GRAY_MEAN)", "replace": "/ 255.0 + MRI_GRAY_MEAN)", "description": "pixel scaling sign flip"},
+  {"file": "src/utils/data_setup.py", "find": "('glioma', 'meningioma', 'pituitary')", "replace": "('glioma', 'pituitary', 'meningioma')", "description": "non-IID clients get the wrong tumour class"},
+  {"file": "src/gia_attack.py", "find": "return torch.argmin(grads[f\"{name}.bias\"]).view(1)", "replace": "return torch.argmax(grads[f\"{name}.bias\"]).view(1)", "description": "iDLG picks the most positive entry"},
+  {"file": "src/gia_attack.py", "find": "return 1 - dot / (dummy_norm * target_norm + 1e-12)", "replace": "return 1 + dot / (dummy_norm * target_norm + 1e-12)", "description": "cosine loss sign flip"},
+  {"file": "src/gia_attack.py", "find": "(load(g) - load(c)) / lr", "replace": "(load(c) - load(g)) / lr", "description": "server gradient sign flip"},
+  {"file": "src/gia_attack.py", "find": "return (g_b @ g_w) / (g_b @ g_b)", "replace": "return (g_b @ g_w)", "description": "analytic FC input loses its normalization"},
+  {"file": "src/mia_attack.py", "find": "x = prior[\"mean\"] + (z * prior[\"std\"]) @ prior[\"components\"]", "replace": "x = prior[\"mean\"] + z @ prior[\"components\"]", "description": "PCA decode drops the component scales"},
+  {"file": "src/federated.py", "find": "optimizer = torch.optim.SGD(self.model.parameters(), lr=float(config[\"lr\"]))", "replace": "optimizer = torch.optim.SGD(self.model.parameters(), lr=2 * float(config[\"lr\"]))", "description": "client FedSGD step uses the wrong step size"},
+  {"file": "src/federated.py", "find": "    def _fit_config(self, server_round):\n        if server_round == self.cfg.capture_round:", "replace": "    def _fit_config(self, server_round):\n        if server_round == self.cfg.capture_round + 1:", "description": "capture round off by one"}
+]
